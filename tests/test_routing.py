@@ -674,7 +674,8 @@ class TestCostBreakdown:
 # ---------------------------------------------------------------------------
 
 class TestSettingsMidTier:
-    def test_default_no_mid(self):
+    def test_default_no_mid(self, monkeypatch):
+        monkeypatch.delenv("NADIRCLAW_MID_MODEL", raising=False)
         from nadirclaw.settings import Settings
         s = Settings()
         assert s.has_mid_tier is False
@@ -704,3 +705,42 @@ class TestSettingsMidTier:
         from nadirclaw.settings import Settings
         s = Settings()
         assert "gpt-4.1-mini" in s.tier_models
+
+
+# ---------------------------------------------------------------------------
+# Bedrock / Model Runner models in registry
+# ---------------------------------------------------------------------------
+
+class TestBedrockModelRegistry:
+    """Verify AWS Bedrock and Model Runner models are in MODEL_REGISTRY."""
+
+    from nadirclaw.routing import MODEL_REGISTRY
+
+    @pytest.mark.parametrize("model_id,expected_window", [
+        ("bedrock/qwen.qwen3-coder-30b-a3b-v1:0", 32_000),
+        ("bedrock/qwen.qwen3-coder-480b-a35b-v1:0", 128_000),
+        ("bedrock/moonshotai.kimi-k2.5", 128_000),
+        ("openai/deepseek.v3.2", 64_000),
+        ("openai/moonshotai.kimi-k2.5", 128_000),
+    ])
+    def test_model_in_registry(self, model_id, expected_window):
+        from nadirclaw.routing import MODEL_REGISTRY
+        assert model_id in MODEL_REGISTRY, f"{model_id} missing from MODEL_REGISTRY"
+        assert MODEL_REGISTRY[model_id]["context_window"] == expected_window
+
+    def test_context_window_check_rejects_oversized(self):
+        """check_context_window should return False when tokens exceed window."""
+        # deepseek.v3.2 has 64K window — create messages exceeding that
+        big_content = "x" * (65_000 * 4)  # ~65K tokens at 4 chars/token
+        messages = [_msg("user", big_content)]
+        assert check_context_window("openai/deepseek.v3.2", messages) is False
+
+    def test_context_window_check_allows_small(self):
+        """check_context_window should return True when tokens fit."""
+        messages = [_msg("user", "Hello world")]
+        assert check_context_window("openai/deepseek.v3.2", messages) is True
+
+    def test_context_window_check_unknown_model_allows(self):
+        """Unknown models should be allowed (returns True)."""
+        messages = [_msg("user", "x" * 1_000_000)]
+        assert check_context_window("unknown/model", messages) is True

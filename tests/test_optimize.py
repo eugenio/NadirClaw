@@ -11,6 +11,7 @@ from nadirclaw.optimize import (
     _minify_json_in_content,
     _normalize_whitespace,
     _trim_chat_history,
+    _truncate_oversized_messages,
     optimize_messages,
 )
 
@@ -472,3 +473,63 @@ class TestAggressiveAccuracy:
         assert "similar to earlier" in last
         assert "Key differences" not in last  # no diff for exact duplicates
         assert result.tokens_saved > 10
+
+
+# ======================================================================
+# Truncate oversized messages
+# ======================================================================
+
+class TestTruncateOversizedMessages:
+    def test_truncates_large_tool_message(self):
+        """A 143K char tool result should be truncated to ~32K chars."""
+        big_content = "recipe listing " * 10_000  # ~150K chars
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "List recipes"},
+            {"role": "tool", "content": big_content},
+        ]
+        result, changed = _truncate_oversized_messages(messages)
+        assert changed is True
+        # Tool message should be truncated
+        assert len(result[2]["content"]) < len(big_content)
+        assert "truncated" in result[2]["content"]
+        # System message untouched
+        assert result[0]["content"] == "You are helpful."
+        # User message untouched
+        assert result[1]["content"] == "List recipes"
+
+    def test_preserves_small_messages(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there, how can I help?"},
+        ]
+        result, changed = _truncate_oversized_messages(messages)
+        assert changed is False
+        assert result == messages
+
+    def test_never_truncates_system(self):
+        """System messages should never be truncated, even if huge."""
+        big_system = "x" * 100_000
+        messages = [{"role": "system", "content": big_system}]
+        result, changed = _truncate_oversized_messages(messages)
+        assert changed is False
+        assert result[0]["content"] == big_system
+
+    def test_truncation_notice_includes_size(self):
+        big_content = "a" * 50_000
+        messages = [{"role": "assistant", "content": big_content}]
+        result, changed = _truncate_oversized_messages(messages)
+        assert changed is True
+        assert "50,000 chars" in result[0]["content"]
+
+    def test_integrated_in_safe_mode(self):
+        """Verify truncation runs as part of safe optimization."""
+        big_content = "data " * 20_000  # ~100K chars
+        messages = [
+            {"role": "system", "content": "Be helpful."},
+            {"role": "tool", "content": big_content},
+            {"role": "user", "content": "What does that say?"},
+        ]
+        result = optimize_messages(messages, mode="safe")
+        assert "truncate_oversized" in result.optimizations_applied
+        assert result.tokens_saved > 0
