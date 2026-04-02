@@ -303,6 +303,43 @@ def _trim_chat_history(
 
 
 # ---------------------------------------------------------------------------
+# Transform 5b — Truncate oversized individual messages
+# ---------------------------------------------------------------------------
+
+_MAX_MESSAGE_TOKENS = 8_000  # ~32K chars — cap any single non-system message
+
+
+def _truncate_oversized_messages(
+    messages: list[dict], max_tokens: int = _MAX_MESSAGE_TOKENS
+) -> tuple[list[dict], bool]:
+    """Truncate individual messages that exceed max_tokens.
+
+    System messages are never truncated. Tool results and long assistant
+    messages are capped to max_tokens with a truncation notice appended.
+    """
+    changed = False
+    result: list[dict] = []
+    max_chars = max_tokens * 4  # rough chars-per-token estimate
+
+    for m in messages:
+        if m.get("role") == "system":
+            result.append(m)
+            continue
+        content = m.get("content")
+        if not isinstance(content, str) or len(content) <= max_chars:
+            result.append(m)
+            continue
+        truncated = content[:max_chars] + (
+            f"\n\n[...truncated: original was {len(content):,} chars, "
+            f"kept first {max_chars:,} for context budget...]"
+        )
+        result.append({**m, "content": truncated})
+        changed = True
+
+    return result, changed
+
+
+# ---------------------------------------------------------------------------
 # JSON object iterator (shared utility)
 # ---------------------------------------------------------------------------
 
@@ -447,6 +484,7 @@ def _semantic_dedup(
 _SAFE_TRANSFORMS = [
     ("system_prompt_dedup", lambda msgs, **_: _dedup_system_prompts(msgs)),
     ("tool_schema_dedup", lambda msgs, **_: _dedup_tool_schemas(msgs)),
+    ("truncate_oversized", lambda msgs, **_: _truncate_oversized_messages(msgs)),
 ]
 
 # Content-level transforms (operate on individual message content strings)
