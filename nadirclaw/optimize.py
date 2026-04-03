@@ -303,6 +303,118 @@ def _trim_chat_history(
 
 
 # ---------------------------------------------------------------------------
+# Transform 5b — Truncate oversized individual messages
+# ---------------------------------------------------------------------------
+
+_MAX_MESSAGE_TOKENS = 8_000  # ~32K chars — cap any single non-system message
+
+
+def _truncate_oversized_messages(
+    messages: list[dict], max_tokens: int = _MAX_MESSAGE_TOKENS
+) -> tuple[list[dict], bool]:
+    """Truncate individual messages that exceed max_tokens.
+
+    System messages are never truncated. Tool results and long assistant
+    messages are capped to max_tokens with a truncation notice appended.
+    """
+    changed = False
+    result: list[dict] = []
+    max_chars = max_tokens * 4  # rough chars-per-token estimate
+
+    for m in messages:
+        if m.get("role") == "system":
+            result.append(m)
+            continue
+        content = m.get("content")
+        if not isinstance(content, str) or len(content) <= max_chars:
+            result.append(m)
+            continue
+        truncated = content[:max_chars] + (
+            f"\n\n[...truncated: original was {len(content):,} chars, "
+            f"kept first {max_chars:,} for context budget...]"
+        )
+        result.append({**m, "content": truncated})
+        changed = True
+
+    return result, changed
+
+
+# ---------------------------------------------------------------------------
+# Transform 6 — Token-budget trim (fit within model context window)
+# ---------------------------------------------------------------------------
+
+def _trim_to_token_budget(
+    messages: list[dict], token_budget: int
+) -> tuple[list[dict], bool]:
+    """Progressively remove oldest non-system turns until total fits in budget.
+
+    Keeps system messages and the first user turn intact. Removes oldest
+    middle turns first. Uses 80% of budget to leave room for response.
+
+    Returns (messages, changed).
+    """
+    effective_budget = int(token_budget * 0.8)
+    current_tokens = _estimate_tokens_messages(messages)
+
+    if current_tokens <= effective_budget:
+        return messages, False
+
+    # Separate system messages from conversation
+    system_msgs: list[dict] = []
+    conversation: list[dict] = []
+    for m in messages:
+        if m.get("role") == "system":
+            system_msgs.append(m)
+        else:
+            conversation.append(m)
+
+    if not conversation:
+        return messages, False
+
+    # Find user turn boundaries
+    user_indices = [i for i, m in enumerate(conversation) if m.get("role") == "user"]
+    if len(user_indices) <= 2:
+        # Can't trim further — only 1-2 turns left
+        return messages, False
+
+    # Keep first turn and progressively shrink from the middle
+    first_turn_end = user_indices[1] if len(user_indices) > 1 else len(conversation)
+    first_turn = conversation[:first_turn_end]
+
+    # Binary search for the right number of recent turns to keep
+    for keep_recent in range(len(user_indices) - 2, 0, -1):
+        last_start_idx = user_indices[-keep_recent]
+        last_turns = conversation[last_start_idx:]
+
+        trimmed_count = len(user_indices) - 1 - keep_recent
+        placeholder = {
+            "role": "system",
+            "content": (
+                f"[...{trimmed_count} middle turns trimmed to fit "
+                f"model context window ({token_budget:,} tokens)...]"
+            ),
+        }
+
+        candidate = system_msgs + first_turn + [placeholder] + last_turns
+        candidate_tokens = _estimate_tokens_messages(candidate)
+
+        if candidate_tokens <= effective_budget:
+            return candidate, True
+
+    # Even keeping just the first turn + last turn doesn't fit — return minimal
+    last_turn_start = user_indices[-1]
+    last_turn = conversation[last_turn_start:]
+    placeholder = {
+        "role": "system",
+        "content": (
+            f"[...{len(user_indices) - 2} middle turns trimmed to fit "
+            f"model context window ({token_budget:,} tokens)...]"
+        ),
+    }
+    return system_msgs + first_turn + [placeholder] + last_turn, True
+
+
+# ---------------------------------------------------------------------------
 # JSON object iterator (shared utility)
 # ---------------------------------------------------------------------------
 
@@ -447,6 +559,7 @@ def _semantic_dedup(
 _SAFE_TRANSFORMS = [
     ("system_prompt_dedup", lambda msgs, **_: _dedup_system_prompts(msgs)),
     ("tool_schema_dedup", lambda msgs, **_: _dedup_tool_schemas(msgs)),
+    ("truncate_oversized", lambda msgs, **_: _truncate_oversized_messages(msgs)),
 ]
 
 # Content-level transforms (operate on individual message content strings)
@@ -460,6 +573,7 @@ def optimize_messages(
     messages: list[dict],
     mode: str = "off",
     max_turns: int = 40,
+    token_budget: int | None = None,
 ) -> OptimizeResult:
     """Optimize a list of message dicts for token reduction.
 
@@ -472,6 +586,10 @@ def optimize_messages(
         (safe + semantic deduplication via sentence embeddings).
     max_turns
         Maximum conversation turns to keep when trimming history.
+    token_budget
+        If set, progressively trim oldest turns until total tokens fit
+        within this budget. Uses 80% of the value to leave room for
+        the model's response. Applied after all other transforms.
 
     Returns
     -------
@@ -524,6 +642,12 @@ def optimize_messages(
     msgs, did_trim = _trim_chat_history(msgs, max_turns=max_turns)
     if did_trim:
         applied.append("chat_history_trim")
+
+    # --- Token-budget trim (fit conversation within model context) ---
+    if token_budget and token_budget > 0:
+        msgs, did_budget_trim = _trim_to_token_budget(msgs, token_budget)
+        if did_budget_trim:
+            applied.append("token_budget_trim")
 
     optimized_tokens = _estimate_tokens_messages(msgs)
 

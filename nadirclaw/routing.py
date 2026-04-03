@@ -52,6 +52,16 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     # Ollama (local, no cost, context varies by model)
     "ollama/llama3.1:8b": {"context_window": 128_000, "cost_per_m_input": 0, "cost_per_m_output": 0, "has_vision": False},
     "ollama/qwen3:32b": {"context_window": 128_000, "cost_per_m_input": 0, "cost_per_m_output": 0, "has_vision": False},
+    # AWS Bedrock models
+    "bedrock/qwen.qwen3-coder-30b-a3b-v1:0": {"context_window": 32_000, "cost_per_m_input": 0.15, "cost_per_m_output": 0.60, "has_vision": False},
+    "bedrock/qwen.qwen3-coder-480b-a35b-v1:0": {"context_window": 128_000, "cost_per_m_input": 0.30, "cost_per_m_output": 1.20, "has_vision": False},
+    "bedrock/moonshotai.kimi-k2.5": {"context_window": 128_000, "cost_per_m_input": 1.00, "cost_per_m_output": 3.00, "has_vision": True},
+    # AWS Model Runner (OpenAI-compatible via Bedrock)
+    "openai/deepseek.v3.2": {"context_window": 64_000, "cost_per_m_input": 0.28, "cost_per_m_output": 0.42, "has_vision": False},
+    "openai/deepseek.v3-v1:0": {"context_window": 64_000, "cost_per_m_input": 0.28, "cost_per_m_output": 0.42, "has_vision": False},
+    "openai/moonshotai.kimi-k2.5": {"context_window": 128_000, "cost_per_m_input": 1.00, "cost_per_m_output": 3.00, "has_vision": True},
+    "openai/minimax.minimax-m2.5": {"context_window": 128_000, "cost_per_m_input": 0.30, "cost_per_m_output": 1.20, "has_vision": False},
+    "openai/qwen.qwen3-coder-next": {"context_window": 128_000, "cost_per_m_input": 0.30, "cost_per_m_output": 1.20, "has_vision": False},
 }
 
 # ---------------------------------------------------------------------------
@@ -71,6 +81,8 @@ MODEL_ALIASES: Dict[str, str] = {
     "o3": "o3",
     "o3-mini": "o3-mini",
     "o4-mini": "o4-mini",
+    "gpt-4o-mini": "openai/deepseek.v3.2",
+    "gpt-4o": "openai/moonshotai.kimi-k2.5",
     "flash": "gemini-2.5-flash",
     "gemini-flash": "gemini-2.5-flash",
     "gemini-pro": "gemini-2.5-pro",
