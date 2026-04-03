@@ -1095,10 +1095,14 @@ async def chat_completions(
                 {"role": m.role, "content": m.text_content()}
                 for m in request.messages
             ]
+            from nadirclaw.routing import get_context_window
+            model_ctx = get_context_window(selected_model)
+
             opt_result = optimize_messages(
                 raw_msgs,
                 mode=optimize_mode,
                 max_turns=settings.OPTIMIZE_MAX_TURNS,
+                token_budget=model_ctx,
             )
             if opt_result.tokens_saved > 0:
                 optimized_msgs = [
@@ -1445,7 +1449,14 @@ async def _stream_litellm(
             msg["name"] = extra_fields["name"]
         messages.append(msg)
 
-    call_kwargs: Dict[str, Any] = {"model": litellm_model, "messages": messages, "stream": True}
+    call_kwargs: Dict[str, Any] = {
+        "model": litellm_model,
+        "messages": messages,
+        "stream": True,
+    }
+    # Only add stream_options for providers known to support it (OpenAI, Anthropic)
+    if any(litellm_model.startswith(p) for p in ("gpt-", "o1-", "o3-", "chatgpt-", "claude-", "anthropic/")):
+        call_kwargs["stream_options"] = {"include_usage": True}
     if request.temperature is not None:
         call_kwargs["temperature"] = request.temperature
     if request.max_tokens is not None:
@@ -1477,10 +1488,48 @@ async def _stream_litellm(
             raise RateLimitExhausted(model=model, retry_after=60)
         raise
 
-    async for chunk in response:
+    # Wrap iteration to handle context overflow errors raised mid-stream by LiteLLM
+    import re as _re
+    _retried = False
+    try:
+        _iter = response.__aiter__()
+        _first_chunk = await _iter.__anext__()
+    except Exception as e:
+        err_str = str(e).lower()
+        m = _re.search(r"passed (\d+) input tokens.*requested (\d+) output.*context length is only (\d+)", err_str)
+        if m and not _retried:
+            input_tok, _, ctx_limit = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            clamped = max(1024, ctx_limit - input_tok - 256)
+            logger.warning("Context overflow on first chunk: %d input + %d requested > %d ctx. Retrying with max_tokens=%d",
+                           input_tok, call_kwargs.get("max_tokens", 0), ctx_limit, clamped)
+            call_kwargs["max_tokens"] = clamped
+            _retried = True
+            response = await litellm.acompletion(**call_kwargs)
+            _iter = response.__aiter__()
+            _first_chunk = await _iter.__anext__()
+        else:
+            raise
+
+    async def _chain_chunks():
+        yield _first_chunk
+        async for c in _iter:
+            yield c
+
+    async for chunk in _chain_chunks():
+        usage = None
+        if hasattr(chunk, "usage") and chunk.usage:
+            usage = {
+                "prompt_tokens": chunk.usage.prompt_tokens or 0,
+                "completion_tokens": chunk.usage.completion_tokens or 0,
+            }
+
         choice = chunk.choices[0] if chunk.choices else None
         if choice is None:
+            # Usage-only final chunk (no choices) — yield usage without content
+            if usage:
+                yield {}, usage, None
             continue
+
         delta = choice.delta
         delta_dict: dict[str, Any] = {}
         if hasattr(delta, "role") and delta.role:
@@ -1492,13 +1541,6 @@ async def _stream_litellm(
                 tc.model_dump() if hasattr(tc, "model_dump") else tc
                 for tc in delta.tool_calls
             ]
-
-        usage = None
-        if hasattr(chunk, "usage") and chunk.usage:
-            usage = {
-                "prompt_tokens": chunk.usage.prompt_tokens or 0,
-                "completion_tokens": chunk.usage.completion_tokens or 0,
-            }
 
         yield delta_dict, usage, choice.finish_reason
 
@@ -1688,6 +1730,7 @@ async def _stream_with_fallback(
 
         content_started = False
         accumulated_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        accumulated_content = []
         last_finish = None
 
         try:
@@ -1700,6 +1743,10 @@ async def _stream_with_fallback(
 
                 if not delta_dict:
                     continue
+
+                # Track content for token estimation fallback
+                if "content" in delta_dict and delta_dict["content"]:
+                    accumulated_content.append(delta_dict["content"])
 
                 # Add role on first content chunk
                 if first_chunk and "role" not in delta_dict:
@@ -1715,6 +1762,14 @@ async def _stream_with_fallback(
                     "choices": [{"index": 0, "delta": delta_dict, "finish_reason": None}],
                 }
                 yield {"data": json.dumps(chunk)}
+
+            # Estimate tokens if upstream didn't provide them
+            if accumulated_usage["prompt_tokens"] == 0 and accumulated_usage["completion_tokens"] == 0:
+                prompt_text = " ".join(m.text_content() for m in request.messages if hasattr(m, "text_content"))
+                completion_text = "".join(accumulated_content)
+                # ~4 chars per token is a reasonable estimate for most models
+                accumulated_usage["prompt_tokens"] = max(1, len(prompt_text) // 4)
+                accumulated_usage["completion_tokens"] = max(1, len(completion_text) // 4)
 
             # Stream completed — send finish chunk with usage
             finish_chunk = {
@@ -1775,7 +1830,18 @@ async def _stream_with_fallback(
                 analysis_info["_stream_error"] = str(e)
                 return
 
-            # Pre-content failure — can try fallback
+            # Pre-content failure — check if it's a context overflow we can fix
+            import re as _re
+            err_str = str(e).lower()
+            m = _re.search(r"passed (\d+) input tokens.*requested (\d+) output.*context length is only (\d+)", err_str)
+            if m:
+                input_tok, req_out, ctx_limit = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                clamped = max(1024, ctx_limit - input_tok - 256)
+                if clamped < req_out:
+                    logger.warning("Context overflow on %s: %d input + %d output > %d ctx. Clamping max_tokens to %d for remaining models",
+                                   model, input_tok, req_out, ctx_limit, clamped)
+                    request.max_tokens = clamped
+            logger.warning("Pre-content streaming error on %s: %s: %s", model, type(e).__name__, str(e)[:300])
             failed_models.append(model)
             last_error = e
             continue
