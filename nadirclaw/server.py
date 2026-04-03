@@ -93,6 +93,24 @@ app.include_router(dashboard_router)
 
 _ROUTING_HEADERS = ("X-Routed-Model", "X-Routed-Tier", "X-Complexity-Score")
 
+
+def _strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks from model output.
+
+    Models like Kimi K2.5 and DeepSeek R1 emit reasoning in <think> tags.
+    This strips them so downstream clients see only the final response.
+    Also handles orphaned </think> tags (where <think> was already stripped).
+    """
+    if not text or "<" not in text:
+        return text
+    import re
+    # Remove complete <think>...</think> blocks (including multiline)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Remove orphaned </think> tags (model sometimes omits opening tag)
+    text = text.replace("</think>", "")
+    # Clean up leading whitespace left after stripping
+    return text.lstrip()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1281,9 +1299,13 @@ async def chat_completions(
         for hdr_name, hdr_val in _routing_headers(selected_model, analysis_info).items():
             response.headers[hdr_name] = hdr_val
 
+        # Strip <think>...</think> tags from non-streaming response
+        _content = response_data["content"] or ""
+        _content = _strip_think_tags(_content)
+
         message: dict[str, Any] = {
             "role": "assistant",
-            "content": response_data["content"],
+            "content": _content,
         }
         if "tool_calls" in response_data:
             message["tool_calls"] = response_data["tool_calls"]
@@ -1731,7 +1753,10 @@ async def _stream_with_fallback(
         content_started = False
         accumulated_usage = {"prompt_tokens": 0, "completion_tokens": 0}
         accumulated_content = []
+        accumulated_reasoning = []
         last_finish = None
+        _in_think_block = False
+        _think_buffer = ""
 
         try:
             first_chunk = True
@@ -1744,9 +1769,49 @@ async def _stream_with_fallback(
                 if not delta_dict:
                     continue
 
-                # Track content for token estimation fallback
+                # --- Strip <think>...</think> tags from content ---
                 if "content" in delta_dict and delta_dict["content"]:
-                    accumulated_content.append(delta_dict["content"])
+                    text = delta_dict["content"]
+                    filtered = []
+
+                    for char in text:
+                        _think_buffer += char
+
+                        if _in_think_block:
+                            # Look for </think> closing tag
+                            if _think_buffer.endswith("</think>"):
+                                accumulated_reasoning.append(
+                                    _think_buffer[:-len("</think>")]
+                                )
+                                _think_buffer = ""
+                                _in_think_block = False
+                        else:
+                            # Look for <think> opening tag
+                            if _think_buffer.endswith("<think>"):
+                                # Remove the "<think>" from any buffered output
+                                pending = _think_buffer[:-len("<think>")]
+                                if pending:
+                                    filtered.append(pending)
+                                _think_buffer = ""
+                                _in_think_block = True
+                            elif len(_think_buffer) > 7:
+                                # Flush safe prefix (keep last 7 chars
+                                # as potential partial "<think>" match)
+                                safe = _think_buffer[:-7]
+                                _think_buffer = _think_buffer[-7:]
+                                filtered.append(safe)
+
+                    # After processing all chars, if not in think and
+                    # buffer hasn't matched, it's safe pending text
+                    # (will be flushed on next chunk or at end)
+
+                    content = "".join(filtered)
+                    if content:
+                        delta_dict = {**delta_dict, "content": content}
+                        accumulated_content.append(content)
+                    else:
+                        # All content was inside <think> — skip this chunk
+                        continue
 
                 # Add role on first content chunk
                 if first_chunk and "role" not in delta_dict:
@@ -1762,6 +1827,18 @@ async def _stream_with_fallback(
                     "choices": [{"index": 0, "delta": delta_dict, "finish_reason": None}],
                 }
                 yield {"data": json.dumps(chunk)}
+
+            # Flush any remaining think buffer as regular content
+            if _think_buffer and not _in_think_block:
+                flush_chunk = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": _think_buffer}, "finish_reason": None}],
+                }
+                accumulated_content.append(_think_buffer)
+                yield {"data": json.dumps(flush_chunk)}
 
             # Estimate tokens if upstream didn't provide them
             if accumulated_usage["prompt_tokens"] == 0 and accumulated_usage["completion_tokens"] == 0:
