@@ -11,6 +11,8 @@ from nadirclaw.optimize import (
     _minify_json_in_content,
     _normalize_whitespace,
     _trim_chat_history,
+    _trim_to_token_budget,
+    _truncate_oversized_messages,
     optimize_messages,
 )
 
@@ -472,3 +474,132 @@ class TestAggressiveAccuracy:
         assert "similar to earlier" in last
         assert "Key differences" not in last  # no diff for exact duplicates
         assert result.tokens_saved > 10
+
+
+# ======================================================================
+# Truncate oversized messages
+# ======================================================================
+
+class TestTruncateOversizedMessages:
+    def test_truncates_large_tool_message(self):
+        """A 143K char tool result should be truncated to ~32K chars."""
+        big_content = "recipe listing " * 10_000  # ~150K chars
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "List recipes"},
+            {"role": "tool", "content": big_content},
+        ]
+        result, changed = _truncate_oversized_messages(messages)
+        assert changed is True
+        # Tool message should be truncated
+        assert len(result[2]["content"]) < len(big_content)
+        assert "truncated" in result[2]["content"]
+        # System message untouched
+        assert result[0]["content"] == "You are helpful."
+        # User message untouched
+        assert result[1]["content"] == "List recipes"
+
+    def test_preserves_small_messages(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there, how can I help?"},
+        ]
+        result, changed = _truncate_oversized_messages(messages)
+        assert changed is False
+        assert result == messages
+
+    def test_never_truncates_system(self):
+        """System messages should never be truncated, even if huge."""
+        big_system = "x" * 100_000
+        messages = [{"role": "system", "content": big_system}]
+        result, changed = _truncate_oversized_messages(messages)
+        assert changed is False
+        assert result[0]["content"] == big_system
+
+    def test_truncation_notice_includes_size(self):
+        big_content = "a" * 50_000
+        messages = [{"role": "assistant", "content": big_content}]
+        result, changed = _truncate_oversized_messages(messages)
+        assert changed is True
+        assert "50,000 chars" in result[0]["content"]
+
+    def test_integrated_in_safe_mode(self):
+        """Verify truncation runs as part of safe optimization."""
+        big_content = "data " * 20_000  # ~100K chars
+        messages = [
+            {"role": "system", "content": "Be helpful."},
+            {"role": "tool", "content": big_content},
+            {"role": "user", "content": "What does that say?"},
+        ]
+        result = optimize_messages(messages, mode="safe")
+        assert "truncate_oversized" in result.optimizations_applied
+        assert result.tokens_saved > 0
+
+
+# ======================================================================
+# Token-budget trim
+# ======================================================================
+
+class TestTokenBudgetTrim:
+    def _make_conversation(self, num_turns: int, chars_per_turn: int = 2000):
+        """Build a synthetic conversation with num_turns user/assistant pairs."""
+        msgs = [{"role": "system", "content": "You are helpful."}]
+        for i in range(num_turns):
+            msgs.append({"role": "user", "content": f"Question {i}: " + "x" * chars_per_turn})
+            msgs.append({"role": "assistant", "content": f"Answer {i}: " + "y" * chars_per_turn})
+        return msgs
+
+    def test_no_trim_when_under_budget(self):
+        msgs = self._make_conversation(3, chars_per_turn=100)
+        result, changed = _trim_to_token_budget(msgs, token_budget=100_000)
+        assert changed is False
+
+    def test_trims_when_over_budget(self):
+        # 40 turns * ~4K chars each = ~160K chars = ~40K tokens
+        msgs = self._make_conversation(40, chars_per_turn=2000)
+        result, changed = _trim_to_token_budget(msgs, token_budget=20_000)
+        assert changed is True
+        assert len(result) < len(msgs)
+        # Should contain the trim placeholder
+        placeholders = [m for m in result if "trimmed" in m.get("content", "")]
+        assert len(placeholders) == 1
+
+    def test_preserves_system_and_first_turn(self):
+        msgs = self._make_conversation(20, chars_per_turn=2000)
+        result, changed = _trim_to_token_budget(msgs, token_budget=10_000)
+        assert changed is True
+        # System message preserved
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == "You are helpful."
+        # First user message preserved
+        assert "Question 0" in result[1]["content"]
+
+    def test_preserves_most_recent_turn(self):
+        msgs = self._make_conversation(20, chars_per_turn=2000)
+        result, changed = _trim_to_token_budget(msgs, token_budget=10_000)
+        assert changed is True
+        # Last message should be the most recent assistant response
+        assert "Answer 19" in result[-1]["content"]
+
+    def test_uses_80_percent_budget(self):
+        """Budget is reduced to 80% to leave room for model response."""
+        # Create conversation exactly at ~budget tokens
+        # 10 turns * 500 chars = 5000 chars = ~1250 tokens
+        msgs = self._make_conversation(10, chars_per_turn=500)
+        # Set budget to ~1500 tokens — 80% = 1200, which is under our ~1250
+        result, changed = _trim_to_token_budget(msgs, token_budget=1500)
+        assert changed is True
+
+    def test_integrated_via_optimize_messages(self):
+        """Token budget works when passed through optimize_messages."""
+        msgs = self._make_conversation(30, chars_per_turn=2000)
+        result = optimize_messages(msgs, mode="safe", token_budget=20_000)
+        assert "token_budget_trim" in result.optimizations_applied
+        # Optimized tokens should be under budget
+        assert result.optimized_tokens < 20_000
+
+    def test_no_budget_trim_when_none(self):
+        """When token_budget is None, no budget trimming occurs."""
+        msgs = self._make_conversation(30, chars_per_turn=2000)
+        result = optimize_messages(msgs, mode="safe", token_budget=None)
+        assert "token_budget_trim" not in result.optimizations_applied
