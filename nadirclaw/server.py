@@ -313,6 +313,8 @@ async def startup():
         logger.info("Ollama base:   %s", settings.OLLAMA_API_BASE)
         if settings.API_BASE:
             logger.info("API base:      %s", settings.API_BASE)
+        for pattern, url in settings.MODEL_API_BASES:
+            logger.info("Model base:    %s → %s", pattern.pattern, url)
         token = settings.AUTH_TOKEN
         if token:
             logger.info("Auth:          %s***", token[:6] if len(token) >= 6 else token)
@@ -792,8 +794,10 @@ async def _call_litellm(
     # Pass api_base for Ollama or custom OpenAI-compatible endpoints
     if litellm_model.startswith("ollama/") or litellm_model.startswith("ollama_chat/"):
         call_kwargs["api_base"] = settings.OLLAMA_API_BASE
-    elif settings.API_BASE and "api_base" not in call_kwargs:
-        call_kwargs["api_base"] = settings.API_BASE
+    elif "api_base" not in call_kwargs:
+        resolved_base = settings.resolve_api_base(model)
+        if resolved_base:
+            call_kwargs["api_base"] = resolved_base
 
     logger.debug("Calling LiteLLM: model=%s (provider=%s)", litellm_model, provider)
     try:
@@ -1499,8 +1503,10 @@ async def _stream_litellm(
 
     if litellm_model.startswith("ollama/") or litellm_model.startswith("ollama_chat/"):
         call_kwargs["api_base"] = settings.OLLAMA_API_BASE
-    elif settings.API_BASE and "api_base" not in call_kwargs:
-        call_kwargs["api_base"] = settings.API_BASE
+    elif "api_base" not in call_kwargs:
+        resolved_base = settings.resolve_api_base(model)
+        if resolved_base:
+            call_kwargs["api_base"] = resolved_base
 
     try:
         response = await litellm.acompletion(**call_kwargs)
@@ -2029,6 +2035,39 @@ async def list_models(
         for m in settings.tier_models
     ]
     return {"object": "list", "data": profiles + tier_data}
+
+
+@app.get("/model/info")
+async def model_info(
+    current_user: UserSession = Depends(validate_local_auth),
+) -> Dict[str, Any]:
+    """Return model info with context windows from NadirClaw's MODEL_REGISTRY.
+
+    Compatible with LiteLLM's /model/info format that Goose expects.
+    """
+    from nadirclaw.routing import MODEL_REGISTRY
+
+    now = int(time.time())
+    data = []
+    for model_id in settings.tier_models:
+        registry_info = MODEL_REGISTRY.get(model_id, {})
+        ctx_window = registry_info.get("context_window", 128_000)
+        data.append({
+            "model_name": model_id,
+            "model_info": {
+                "id": model_id,
+                "max_input_tokens": ctx_window,
+                "max_output_tokens": min(ctx_window // 4, 32_000),
+                "input_cost_per_token": registry_info.get("cost_per_m_input", 0) / 1_000_000,
+                "output_cost_per_token": registry_info.get("cost_per_m_output", 0) / 1_000_000,
+                "supports_vision": registry_info.get("has_vision", False),
+                "supports_prompt_caching": False,
+            },
+            "litellm_params": {
+                "model": model_id,
+            },
+        })
+    return {"data": data}
 
 
 @app.get("/metrics")

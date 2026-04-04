@@ -97,6 +97,8 @@ That's it. NadirClaw starts on `http://localhost:8856` with sensible defaults (G
 - **Streaming support** — full SSE streaming compatible with OpenClaw, Codex, and other streaming clients
 - **Native Gemini support** — calls Gemini models directly via the Google GenAI SDK (not through LiteLLM)
 - **OAuth login** — use your subscription with `nadirclaw auth <provider> login` (OpenAI, Anthropic, Google), no API key needed
+- **Multi-region routing** — route different models to different API endpoints via `NADIRCLAW_MODEL_API_BASES`, enabling cross-region AWS Bedrock or mixed-provider deployments with wildcard pattern matching
+- **Model info endpoint** — `GET /model/info` serves context windows and capabilities from NadirClaw's own model registry, so clients (Goose, OpenCode) see correct limits even for models LiteLLM doesn't know
 - **Multi-provider** — supports Gemini, OpenAI, Anthropic, Ollama, and any LiteLLM-supported provider
 - **OpenAI-compatible API** — drop-in replacement for any tool that speaks the OpenAI chat completions API
 - **Request reporting** — `nadirclaw report` with per-model and per-day cost breakdown (`--by-model --by-day`), anomaly flagging, filters, latency stats, tier breakdown, and token usage
@@ -272,6 +274,24 @@ NADIRCLAW_REASONING_MODEL=o3                           # reasoning tasks (option
 NADIRCLAW_FREE_MODEL=ollama/llama3.1:8b                # free fallback (optional, defaults to simple)
 NADIRCLAW_FALLBACK_CHAIN=gpt-4.1,claude-sonnet-4-5-20250929,gemini-2.5-flash  # cascade order on failure (optional)
 ```
+
+### Multi-Region / Multi-Endpoint Routing
+
+Route different models to different API endpoints using `NADIRCLAW_MODEL_API_BASES`. This is useful when models are available in different AWS regions or when you want to mix providers with different base URLs.
+
+```bash
+# Default endpoint (used when no per-model pattern matches)
+NADIRCLAW_API_BASE=https://bedrock-mantle.eu-west-2.api.aws/v1
+
+# Per-model overrides (pattern=url, comma-separated)
+# Patterns support * and ? wildcards. First match wins.
+NADIRCLAW_MODEL_API_BASES=openai/zai.glm-5=https://bedrock-mantle.us-west-1.api.aws/v1,openai/moonshotai.*=https://bedrock-mantle.us-east-1.api.aws/v1
+```
+
+In this example:
+- `openai/zai.glm-5` routes to us-west-1
+- `openai/moonshotai.*` (Kimi K2.5, etc.) routes to us-east-1
+- All other `openai/*` models fall back to the default eu-west-2
 
 ### Example Setups
 

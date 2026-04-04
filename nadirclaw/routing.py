@@ -62,6 +62,9 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "openai/moonshotai.kimi-k2.5": {"context_window": 128_000, "cost_per_m_input": 1.00, "cost_per_m_output": 3.00, "has_vision": True},
     "openai/minimax.minimax-m2.5": {"context_window": 128_000, "cost_per_m_input": 0.30, "cost_per_m_output": 1.20, "has_vision": False},
     "openai/qwen.qwen3-coder-next": {"context_window": 128_000, "cost_per_m_input": 0.30, "cost_per_m_output": 1.20, "has_vision": False},
+    # ZhipuAI GLM models (via Bedrock Mantle)
+    "openai/zai.glm-5": {"context_window": 1_000_000, "cost_per_m_input": 1.00, "cost_per_m_output": 3.20, "has_vision": True},
+    "openai/zai.glm-4.7": {"context_window": 202_000, "cost_per_m_input": 0.60, "cost_per_m_output": 2.20, "has_vision": True},
 }
 
 # ---------------------------------------------------------------------------

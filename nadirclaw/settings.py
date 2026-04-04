@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -74,6 +75,57 @@ class Settings:
         When set, passed as api_base to all non-Ollama, non-Gemini LiteLLM calls.
         """
         return os.getenv("NADIRCLAW_API_BASE", "")
+
+    @property
+    def MODEL_API_BASES(self) -> list[tuple[re.Pattern[str], str]]:
+        """Per-model API base URL overrides for multi-region/multi-endpoint routing.
+
+        Allows different models to be routed to different API endpoints,
+        enabling multi-region AWS Bedrock or mixed provider deployments.
+
+        Format: NADIRCLAW_MODEL_API_BASES=<pattern>=<url>,<pattern>=<url>
+        Patterns support * and ? wildcards (fnmatch-style, converted to regex).
+
+        Example:
+          NADIRCLAW_MODEL_API_BASES=openai/deepseek.*=https://bedrock-mantle.eu-west-2.api.aws/v1,openai/moonshotai.*=https://bedrock-mantle.us-east-1.api.aws/v1
+
+        Evaluated in order; first match wins. Falls back to API_BASE if no match.
+        """
+        raw = os.getenv("NADIRCLAW_MODEL_API_BASES", "")
+        if not raw:
+            return []
+        entries: list[tuple[re.Pattern[str], str]] = []
+        for item in raw.split(","):
+            item = item.strip()
+            if "=" not in item:
+                continue
+            # Split on first '=' only (URLs contain '=' sometimes in query params)
+            pattern_str, url = item.split("=", 1)
+            pattern_str = pattern_str.strip()
+            url = url.strip()
+            if not pattern_str or not url:
+                continue
+            # Convert fnmatch-style wildcards to regex
+            regex_str = re.escape(pattern_str).replace(r"\*", ".*").replace(r"\?", ".")
+            try:
+                entries.append((re.compile(f"^{regex_str}$"), url))
+            except re.error:
+                _settings_logger.warning(
+                    "Invalid pattern in NADIRCLAW_MODEL_API_BASES: %r — skipping.",
+                    pattern_str,
+                )
+        return entries
+
+    def resolve_api_base(self, model: str) -> str:
+        """Resolve the API base URL for a given model.
+
+        Checks MODEL_API_BASES first (per-model overrides), then falls back
+        to API_BASE (global default). Returns empty string if neither matches.
+        """
+        for pattern, url in self.MODEL_API_BASES:
+            if pattern.match(model):
+                return url
+        return self.API_BASE
 
     @property
     def CONFIDENCE_THRESHOLD(self) -> float:
